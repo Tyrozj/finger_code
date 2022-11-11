@@ -1,0 +1,565 @@
+#!/usr/bin/python
+# -*- coding: UTF-8 -*-
+import cv2
+import sys
+import scipy as sp
+import math
+import copy
+import numpy as np
+from enhance import image_enhance  # 见下文
+from core import get_core  # 见下文
+from skimage.morphology import skeletonize
+
+
+def plt_show(image, name, draw=None, core=None):
+    image = image.astype(np.uint8)
+    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(name, 288, 384)
+    cimg = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    if draw:
+        for point in draw.keys():
+            if draw[point][0] == 1:
+                cv2.circle(cimg, (point[1], point[0]), 1, (0, 0, 255), thickness=-1)
+            elif draw[point][0] == 2:
+                cv2.circle(cimg, (point[1], point[0]), 1, (255, 0, 0), thickness=-1)
+            else:
+                pass
+    if core is not None:
+        cv2.circle(cimg, (core[1], core[0]), 1, (0, 255, 0), thickness=-1)
+    cv2.imshow(name, cimg)
+    cv2.waitKey(0)
+
+
+class FingerProcess(object):
+    """
+    图像质量判断
+    纹线平滑
+    指纹区域检测
+    指纹方向图和频率估算
+    图像二值化（将指纹图像中各像素点的灰度值设置为0或255）
+    图像细化
+    """
+
+    def __init__(self, is_showing):
+        self.height = 0
+        self.width = 0
+        self.is_showing = is_showing
+
+    def enhanced(self, image_path):
+
+        img = cv2.imread(image_path)
+        if len(img.shape) > 2:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        if np.shape(img) != (384, 288):
+            img = cv2.resize(img, (288, 384))
+
+        enhanced_img = image_enhance(img).astype(np.int)
+
+        if self.is_showing == True:
+            plt_show(image=enhanced_img * 255, name='image_enhanced')
+        return enhanced_img
+
+    def normalization(self, image):
+        """
+        Gray value is limited to a certain range
+        :param image:
+        :return:
+        """
+        (self.height, self.width) = np.shape(image)
+        mean = np.mean(image)
+        variance = np.std(image)
+        for i in range(self.height):
+            for j in range(self.width):
+                pixel = image[i, j]
+                change = np.sqrt(1000. * (pixel - mean) / variance) if pixel > mean else \
+                    -np.sqrt(1000. * (mean - pixel) / variance)
+                image[i, j] = max(min(150. + change, 255), 0)
+        if self.is_showing == True:
+            plt_show(image=image, name='image_norm')
+        return image
+
+    def segamentation(self, image):
+        """
+        Distinguish between foreground and background colors
+        :param image:
+        :return:
+        """
+        region = 3
+        h_region = int(np.floor(self.height / region))
+        w_region = int(np.floor(self.width / region))
+        # each region average and variance
+        ave_region = np.zeros((h_region, w_region))
+        var_region = np.zeros((h_region, w_region))
+        for i in range(h_region):
+            for j in range(w_region):
+                image_region = image[region * i:region * (i + 1), region * j:region * (j + 1)]
+                ave_region[i, j] = np.mean(image_region)
+                var_region[i, j] = np.var(image_region)
+        # total average and variance
+        ave_region_total = np.mean(ave_region)
+        var_region_total = np.mean(var_region)
+        # foreground average and variance
+        fg_ave = np.mean(ave_region[ave_region < ave_region_total])
+        fg_var = np.mean(var_region[var_region > var_region_total])
+        # background average and variance
+        bg_ave = np.mean(ave_region[ave_region > fg_ave])
+        var_region_zero = var_region[0 < var_region]
+        bg_var = np.mean(var_region_zero[var_region_zero < fg_var])
+        binary = np.zeros((h_region, w_region))
+        # determine background region
+        for i in range(h_region):
+            for j in range(w_region):
+                if var_region[i, j] < bg_var:
+                    binary[i, j] = 1
+        for i in range(1, h_region - 1):
+            for j in range(1, w_region - 1):
+                if (binary[i, j] == 1) and (np.sum(binary[i - 1:i + 2, j - 1:j + 2]) <= 5):
+                    binary[i, j] = 0
+                else:
+                    pass
+        # replace background by foreground average
+        image_mask = np.zeros((self.height, self.width))
+        for i in range(self.height):
+            for j in range(self.width):
+                if binary[int(i / 3), int(j / 3)] == 1:
+                    image[i, j] = fg_ave
+                    image_mask[i, j] = 1
+                else:
+                    pass
+        # black and white flip
+        image_mask = abs(image_mask - 1)
+        if self.is_showing == True:
+            plt_show(image=image_mask * 255, name='image_mask')
+            plt_show(image=image, name='image_sega')
+        return image, image_mask
+
+    def enhance_grain(self, image, image_mask):
+        """
+        Enhance fingerprint lines along the ridge line
+        :param image:
+        :return:
+        """
+        # mean filter denoising
+        image = np.array(image, dtype=np.float32)
+        kernel = np.array([[1, 1, 1], [1, 1, 1], [1, 1, 1]], np.float32) / 9
+        image_conv = cv2.filter2D(image, -1, kernel)
+        if self.is_showing == True:
+            plt_show(image=image_conv, name='image_conv')
+        # smoothed image matrix
+        image_direction = np.zeros((self.height, self.width))
+        for i in range(4, self.height - 4):
+            for j in range(4, self.width - 4):
+                sum_1 = image_conv[i, j - 4] + image_conv[i, j - 2] + image_conv[i, j + 2] + image_conv[i, j + 4]
+                sum_2 = image_conv[i - 2, j + 4] + image_conv[i - 1, j + 2] + image_conv[i + 1, j - 2] + image_conv[
+                    i + 2, j - 4]
+                sum_3 = image_conv[i - 2, j + 2] + image_conv[i - 4, j + 4] + image_conv[i + 2, j - 2] + image_conv[
+                    i + 4, j - 4]
+                sum_4 = image_conv[i - 2, j + 1] + image_conv[i - 4, j + 2] + image_conv[i + 2, j - 1] + image_conv[
+                    i + 4, j - 2]
+                sum_5 = image_conv[i - 2, j] + image_conv[i - 4, j] + image_conv[i + 2, j] + image_conv[i + 4, j]
+                sum_6 = image_conv[i - 4, j - 2] + image_conv[i - 2, j - 1] + image_conv[i + 2, j + 1] + image_conv[
+                    i + 4, j + 2]
+                sum_7 = image_conv[i - 4, j - 4] + image_conv[i - 2, j - 2] + image_conv[i + 2, j + 2] + image_conv[
+                    i + 4, j + 4]
+                sum_8 = image_conv[i - 2, j - 4] + image_conv[i - 1, j - 2] + image_conv[i + 1, j + 2] + image_conv[
+                    i + 2, j + 4]
+                sum_direction = np.array([sum_1, sum_2, sum_3, sum_4, sum_5, sum_6, sum_7, sum_8], np.float32)
+                sum_max = np.max(sum_direction)
+                sum_min = np.min(sum_direction)
+                sum_ave = np.mean(sum_direction)
+                sum_pixel = sum_min if (sum_max + sum_min + 4 * image_conv[i][j]) > (3 * sum_ave) else sum_max
+                image_direction[i][j] = 128 if sum_pixel > sum_ave else 255
+        if self.is_showing == True:
+            plt_show(image=image_direction, name='image_direction')
+
+        image_enhanced = np.multiply(image_direction, image_mask)
+        if self.is_showing == True:
+            plt_show(image=image_enhanced, name='image_grain')
+        image_enhanced_binary = image_enhanced != 128
+        if self.is_showing == True:
+            plt_show(image=image_enhanced_binary * 255, name='image_grain_binary')
+        return image_enhanced_binary
+
+    def remove_voids(self, image):
+        """
+        Remove voids from fingerprints.
+        the 4 neighborhood points of the black point are burrs if three or more are white points.
+        :return:
+        """
+        for i in range(1, self.height - 1):
+            for j in range(1, self.width - 1):
+                if image[i, j] == 0 and (image[i, j - 1] + image[i, j + 1] + image[i - 1, j] + image[i + 1, j]) >= 3:
+                    image[i, j] = 1
+                else:
+                    pass
+        if self.is_showing == True:
+            plt_show(image=image * 255, name='image_remove_voids')
+        return image
+
+    def remove_burrs(self, image):
+        """
+        Remove burrs from fingerprints.
+        the point is white (background) and the circumference is black (foreground).
+        The sum of the eight fields is two, and the hole is 0.
+        :param image:
+        :return:
+        """
+        image = image.astype(int)
+        for i in range(1, self.height - 1):
+            for j in range(1, self.width - 1):
+                if image[i, j] == 1:
+                    # clockwise expand of 8 neighborhood points
+                    pixel_up = [image[i - 1, j]]
+                    pixel_right = image[i - 1:i + 2, j + 1]
+                    pixel_down = [image[i + 1, j]]
+                    pixel_left = list(reversed(image[i - 1:i + 2, j - 1]))
+                    # subtractively
+                    neighbor_expansion = np.concatenate((pixel_up, pixel_right, pixel_down, pixel_left), axis=0)
+                    neighbor_expansion_copy = np.concatenate((pixel_right, pixel_down, pixel_left, pixel_up), axis=0)
+                    neighbor_sum = sum(list(map(lambda x: abs(x), neighbor_expansion - neighbor_expansion_copy)))
+                    neighbor_diagonal = sum(neighbor_expansion[:3]) * sum(neighbor_expansion[5:8]) \
+                                        + sum(neighbor_expansion_copy[1:4]) * sum(neighbor_expansion_copy[5:8])
+                    if neighbor_sum != 1 and neighbor_diagonal == 0:
+                        image[i, j] = 0
+                    else:
+                        pass
+                else:
+                    pass
+        if self.is_showing == True:
+            plt_show(image=image * 255, name='image_remove_burrs')
+        return image
+
+    def thinning(self, image):
+        """
+        Image thinning
+        :param image:
+        :return:
+        """
+        image = (image * 255).astype(np.uint8)
+        mask = cv2.bitwise_not(image) / 255
+        # implementing a skeleton algorithm
+        skeleton = skeletonize(mask)
+        skeleton = (skeleton * 255).astype(np.uint8)
+        image_thin = cv2.bitwise_not(skeleton) / 255
+        if self.is_showing == True:
+            plt_show(image=image_thin * 255, name='image_thin')
+
+        return image_thin
+
+
+class GetFeaturePoint(object):
+
+    def __init__(self, image, is_showing):
+        self.image = image
+        (self.height, self.width) = np.shape(image)
+        self.x_values = 0
+        self.y_values = 0
+        self.is_showing = is_showing
+        self.feature_cn_sn = {}
+
+    def line_angle(self, point, v1, v2):
+        (dx1, dy1) = (v1[0] - point[0], v1[1] - point[1])
+        (dx2, dy2) = (v2[0] - point[0], v2[1] - point[1])
+        angle1 = math.atan2(dy1, dx1)
+        angle1 = int(angle1 * 180 / math.pi)
+        # print(angle1)
+        angle2 = math.atan2(dy2, dx2)
+        angle2 = int(angle2 * 180 / math.pi)
+        # print(angle2)
+        if angle1 * angle2 >= 0:
+            included_angle = abs(angle1 - angle2)
+        else:
+            included_angle = abs(angle1) + abs(angle2)
+            if included_angle > 180:
+                included_angle = 360 - included_angle
+        return included_angle
+
+    def edge_walk(self, init_point, walk_step, feature_points, image, check):
+        if check == True:
+            if init_point in feature_points:
+                return [init_point]
+        height, width = np.shape(image)
+        init_point = [init_point]
+        direction = [(-1, 1), (-1, 0), (-1, -1), (0, 1), (0, -1), (1, 1), (1, 0), (1, -1)]
+        (x_walk, y_walk, last_step) = (0, 0, (0, 0))
+        if walk_step == 1:
+            walk_points = []
+            for step in direction:
+                x_walk = init_point[0][0] + step[0]
+                y_walk = init_point[0][1] + step[1]
+                if x_walk >= height or x_walk < 0 or y_walk >= width or y_walk < 0:
+                    pass
+                elif image[x_walk, y_walk] == 0:
+                    walk_points.append((x_walk, y_walk))
+                else:
+                    pass
+            return walk_points
+        else:
+            for i in range(walk_step):
+                walk_points = []
+                if i == 0:
+                    walk_direction = copy.deepcopy(direction)
+                else:
+                    walk_direction = copy.deepcopy(direction)
+                    print(i, walk_direction, (-last_step[0], -last_step[1]))
+                    walk_direction.remove((-last_step[0], -last_step[1]))
+                for step in walk_direction:
+                    if init_point == []:
+                        return []
+                    else:
+                        x_walk = init_point[0][0] + step[0]
+                        y_walk = init_point[0][1] + step[1]
+                    if x_walk >= height or x_walk < 0 or y_walk >= width or y_walk < 0:
+                        return [init_point[0]]
+                    elif image[x_walk, y_walk] == 0:
+                        if (x_walk, y_walk) in feature_points:
+                            terminal_point = [(x_walk, y_walk)]
+                            return terminal_point
+                        else:
+                            walk_points.append((x_walk, y_walk))
+                            last_step = step
+                    else:
+                        return [init_point[0]]
+                init_point = walk_points
+        terminal_point = init_point
+        return terminal_point
+
+    def cn_and_sn(self):
+        """
+        cn: crossing number
+        sn: sum of 8 neighborhood points
+        Find all endpoints and intersections of the thinned image.
+        :param image:
+        :return:
+        """
+        for i in range(1, self.height - 1):
+            for j in range(1, self.width - 1):
+                if self.image[i, j] == 0:
+                    # clockwise expand of 8 neighborhood points
+                    pixel_up = [self.image[i - 1, j]]
+                    pixel_right = self.image[i - 1:i + 2, j + 1]
+                    pixel_down = [self.image[i + 1, j]]
+                    pixel_left = list(reversed(self.image[i - 1:i + 2, j - 1]))
+                    # subtractively
+                    neighbor_expansion = np.concatenate((pixel_up, pixel_right, pixel_down, pixel_left), axis=0)
+                    neighbor_expansion_copy = np.concatenate((pixel_right, pixel_down, pixel_left, pixel_up), axis=0)
+                    cn = 1 / 2 * sum(list(map(lambda x: abs(x), neighbor_expansion - neighbor_expansion_copy)))
+                    sn = np.sum(self.image[i - 1:i + 2, j - 1:j + 2]) - self.image[i, j]
+                    if cn == 1 and sn == 7:
+                        self.feature_cn_sn[(i, j)] = [1]
+                    elif cn == 3 and sn == 5:
+                        self.feature_cn_sn[(i, j)] = [2]
+        if self.is_showing == True:
+            plt_show(image=self.image * 255, name='features', draw=self.feature_cn_sn)
+
+    def feature_point_angle(self):
+        """
+        :param feature_cn_sn:
+        :return:
+        """
+        feature_points = list(self.feature_cn_sn.keys())
+        for point in feature_points:
+            rm_feature_points = copy.deepcopy(feature_points)
+            rm_feature_points.remove(point)
+            # endpoint angle
+            if self.feature_cn_sn[point][0] == 1:
+                (terminal_x, terminal_y) = \
+                self.edge_walk(init_point=point, walk_step=7, feature_points=rm_feature_points, image=self.image,
+                               check=False)[0]
+                angle = math.atan2(terminal_y - point[1], terminal_x - point[0])
+                angle = int(angle * 180 / math.pi)
+                self.feature_cn_sn[point].append(angle)
+            # intersection angle
+            elif self.feature_cn_sn[point][0] == 2:
+                point_diagonal = {}
+                step_1_points = self.edge_walk(init_point=point, walk_step=1, feature_points=rm_feature_points,
+                                               image=self.image, check=False)
+                # print(step_1_points)
+                point1 = step_1_points[0]
+                point2 = step_1_points[1]
+                point3 = step_1_points[2]
+                point_diagonal[point3] = self.line_angle(point=point, v1=point1, v2=point2)
+                point_diagonal[point2] = self.line_angle(point=point, v1=point1, v2=point3)
+                point_diagonal[point1] = self.line_angle(point=point, v1=point2, v2=point3)
+                dicSortList = sorted(point_diagonal.items(), key=lambda x: x[1])
+                image_rm_point = copy.deepcopy(self.image)
+                image_rm_point[point[0], point[1]] = 1
+                image_rm_point[dicSortList[1][0][0], dicSortList[1][0][1]] = 1
+                image_rm_point[dicSortList[2][0][0], dicSortList[2][0][1]] = 1
+                (terminal_x, terminal_y) = \
+                self.edge_walk(init_point=dicSortList[0][0], walk_step=6, feature_points=feature_points,
+                               image=image_rm_point, check=True)[0]
+                angle = math.atan2(terminal_y - point[1], terminal_x - point[0])
+                angle = int(angle * 180 / math.pi)
+                self.feature_cn_sn[point].append(angle)
+
+    def rm_burr_and_short_ridges(self):
+        """
+        The line is smoothed. Find each end point so that it moves 5 pixels along the direction of the line.
+         f the intersection is encountered within 5 pixels, the endpoint is considered as a burr, and removed.
+        :param feature_points:
+        :return:
+        """
+        endpoints = [k for k, v in self.feature_cn_sn.items() if v[0] == 1]
+        print(endpoints)
+        feature_points = self.feature_cn_sn.keys()
+        rm_points = []
+        for point in endpoints:
+            return_point = \
+            self.edge_walk(init_point=point, walk_step=7, feature_points=feature_points, image=self.image, check=False)[
+                0]
+            if return_point in feature_points:
+                rm_points.append(point)
+                rm_points.append(return_point)
+            else:
+                pass
+        rm_points = list(set(rm_points))
+        for point in rm_points:
+            self.feature_cn_sn.pop(point)
+        print(sys._getframe().f_code.co_name, len(rm_points), len(self.feature_cn_sn))
+        if self.is_showing == True:
+            plt_show(image=self.image * 255, name='rm_burr_and_short_ridges', draw=self.feature_cn_sn)
+
+    def rm_boundary(self, image_mask):
+        """
+        Remove the endpoint of the edge of the image
+        :param feature_points:
+        :return:
+        """
+        bound_dist = 5
+        rm_points = []
+        for point in self.feature_cn_sn.keys():
+            (x, y) = point
+            if image_mask[min(x + bound_dist, self.height - 1), y] == 0 \
+                    or image_mask[max(x - bound_dist, 0), y] == 0 \
+                    or image_mask[x, min(y + bound_dist, self.width - 1)] == 0 \
+                    or image_mask[x, max(y - bound_dist, 0)] == 0:
+                rm_points.append(point)
+            else:
+                pass
+        for point in rm_points:
+            self.feature_cn_sn.pop(point)
+        print(sys._getframe().f_code.co_name, len(rm_points), len(self.feature_cn_sn))
+        if self.is_showing == True:
+            plt_show(image=self.image * 255, name='rm_boundary', draw=self.feature_cn_sn)
+
+    def rm_broken_ridge(self):
+        """
+        There are no intersections or endpoints within 10 distances
+        :param feature_points:
+        :return:
+        """
+        endpoints = [k for k, v in self.feature_cn_sn.items() if v[0] == 1]
+        endpoints_num = len(endpoints)
+        rm_points = []
+        for i in range(endpoints_num - 1):
+            for j in range(i + 1, endpoints_num):
+                distance = sp.spatial.distance.euclidean(endpoints[i], endpoints[j])
+
+                if distance <= 10:
+                    a_i = self.feature_cn_sn[endpoints[i]][1]
+                    a_j = self.feature_cn_sn[endpoints[j]][1]
+                    angle = math.atan2(endpoints[j][1] - endpoints[i][1], endpoints[j][0] - endpoints[i][0])
+                    a_i_j = int(angle * 180 / math.pi)
+                    if (abs(a_i_j - a_i) < 30) or (abs(a_i_j - a_j) < 30):
+                        rm_points.append(endpoints[i])
+                        rm_points.append(endpoints[j])
+                    else:
+
+                        pass
+                else:
+                    pass
+        rm_points = list(set(rm_points))
+        for point in rm_points:
+            self.feature_cn_sn.pop(point)
+        print(sys._getframe().f_code.co_name, len(rm_points), len(self.feature_cn_sn))
+        if self.is_showing == True:
+            plt_show(image=self.image * 255, name='rm_broken_ridge', draw=self.feature_cn_sn)
+
+    def rm_island_and_fakeBridge(self):
+        intersections = [k for k, v in self.feature_cn_sn.items() if v[0] == 2]
+        intersections_near = {}
+        rm_points = []
+        # Get neighbor intersections for every intersection
+        for point in intersections:
+            intersections_near[point] = []
+            points = self.edge_walk(init_point=point, walk_step=1, feature_points=intersections, image=self.image,
+                                    check=False)
+            image_rm_point = copy.deepcopy(self.image)
+            image_rm_point[point[0], point[1]] = 1
+            for eachs in points:
+                image_rm_point[eachs[0], eachs[1]] = 1
+            for point_1_step in points:
+                return_point = self.edge_walk(init_point=point_1_step, walk_step=7, feature_points=intersections,
+                                              image=image_rm_point, check=True)
+                if return_point == []:
+                    rm_points.append(point)
+                else:
+                    return_point = return_point[0]
+                    if return_point in intersections:
+                        intersections_near[point].append(return_point)
+                    else:
+                        pass
+
+        intersections_near = {k: v for k, v in intersections_near.items() if len(v) != 0}
+
+        intersections_near_num = len(intersections_near)
+        for i in range(intersections_near_num - 1):
+            for j in range(i + 1, intersections_near_num):
+                values = list(intersections_near.values())
+                keys = list(intersections_near.keys())
+                intersection_same = [x for x in values[i] if x in values[j]]
+                # Remove island
+                if len(intersection_same) != 0:
+                    print('%s||%s??%s||%s' % (str(keys[i]), str(values[j]), str(keys[j]), str(values[i])))
+                    rm_points.append(keys[i])
+                    rm_points.append(keys[j])
+                    rm_points.append(intersection_same[0])
+                # Remove fake bridge
+                elif (keys[j] in values[i]) or (keys[i] in values[j]):
+                    print('%s||%s=%s||%s' % (str(keys[i]), str(values[j]), str(keys[j]), str(values[i])))
+                    a_i = self.feature_cn_sn[keys[i]][1]
+                    a_j = self.feature_cn_sn[keys[j]][1]
+                    angle = math.atan2(keys[j][1] - keys[i][1], keys[j][0] - keys[i][0])
+                    a_i_j = int(angle * 180 / math.pi)
+                    if (70 < abs(a_i_j - a_i) < 110) or (70 < abs(a_i_j - a_j) < 110):
+                        rm_points.append(keys[i])
+                        rm_points.append(keys[j])
+                    else:
+                        pass
+                else:
+                    pass
+        rm_points = list(set(rm_points))
+        for point in rm_points:
+            self.feature_cn_sn.pop(point)
+        print(sys._getframe().f_code.co_name, len(rm_points), len(self.feature_cn_sn))
+        if self.is_showing == True:
+            plt_show(image=self.image * 255, name='rm_island_and_fakeBridge', draw=self.feature_cn_sn)
+        return self.feature_cn_sn
+
+
+def run(image_path, is_showing=True):
+    op1 = FingerProcess(is_showing=is_showing)
+    image_enhanced = op1.enhanced(image_path=image_path)
+    image_norm = op1.normalization(image=image_enhanced)
+    image_sega, image_mask = op1.segamentation(image=image_norm)
+    image_grain = op1.enhance_grain(image=image_sega, image_mask=image_mask)
+    image_rm_void = op1.remove_voids(image=image_grain)
+    image_rm_burr = op1.remove_burrs(image=image_rm_void)
+    image_thin = op1.thinning(image=image_rm_burr)
+    core = get_core(image=image_thin)[0]
+    print(core)
+    # plt_show(image=image_thin * 255, name='core', core=core)
+
+    op2 = GetFeaturePoint(image=image_thin, is_showing=is_showing)
+    op2.cn_and_sn()
+    op2.feature_point_angle()
+    op2.rm_burr_and_short_ridges()
+    op2.rm_boundary(image_mask=image_mask)
+    op2.rm_broken_ridge()
+    feature_points = op2.rm_island_and_fakeBridge()
+    return feature_points, core
+
+
+if __name__ == "__main__":
+    features, core = run(image_path='F:/coding/fingering_detect/code1/image_enhanced.tiff')
